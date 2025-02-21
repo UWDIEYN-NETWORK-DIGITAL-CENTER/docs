@@ -1,63 +1,131 @@
-# This Dockerfile can be used for docker-based deployments to platforms
-# like Now or Moda, but it is currently _not_ used by our Heroku deployments
-# It uses two multi-stage builds: `install` and the main build to keep the image size down.
+# This Dockerfile is used solely for production deployments to Moda
+# For building this file locally, see src/deployments/production/README.md
+# Environment variables are set in the Moda configuration:
+#   config/moda/configuration/*/env.yaml
 
-# --------------------------------------------------------------------------------
-# INSTALL IMAGE
-# A temporary image that installs production-only dependencies and builds the production-ready front-end bundles.
+# ---------------------------------------------------------------
+# BASE STAGE: Install linux dependencies and set up the node user
+# ---------------------------------------------------------------
+# To update the sha:
+# https://github.com/github/gh-base-image/pkgs/container/gh-base-image%2Fgh-base-noble
+FROM ghcr.io/github/gh-base-image/gh-base-noble:20250218-181933-g3ea4154ca AS base
 
-FROM node:14-alpine as install
-RUN apk add --no-cache python make g++
-ENV NODE_ENV production
-WORKDIR /usr/src/docs
-COPY package*.json ./
-COPY javascripts ./javascripts
-COPY stylesheets ./stylesheets
-COPY lib ./lib
-COPY webpack.config.js ./webpack.config.js
-RUN npm ci --production
-RUN npm run build
+# Install curl for Node install and determining the early access branch
+# Install git for cloning docs-early-access & translations repos
+# Install Node.js latest LTS
+# https://github.com/nodejs/release#release-schedule
+# Ubuntu's apt-get install nodejs is _very_ outdated
+# Must run as root
+RUN apt-get -qq update && apt-get -qq install --no-install-recommends curl git \
+  && curl -sL https://deb.nodesource.com/setup_22.x | bash - \
+  && apt-get install -y nodejs \
+  && node --version
 
-# --------------------------------------------------------------------------------
-# MAIN IMAGE
+# Create the node user and home directory
+ARG APP_HOME="/home/node/app" # Define in base so all child stages inherit it
+RUN useradd -ms /bin/bash node \
+  && mkdir -p $APP_HOME && chown -R node:node $APP_HOME
 
-FROM node:14-alpine
+# -----------------------------------------------------------------
+# CLONES STAGE: Clone docs-internal, early-access, and translations
+# -----------------------------------------------------------------
+FROM base AS clones
+USER node:node
+WORKDIR $APP_HOME
 
-# Let's make our home
-WORKDIR /usr/src/docs
+# We need to copy over content that will be merged with early-access
+COPY --chown=node:node content content/
+COPY --chown=node:node assets assets/
+COPY --chown=node:node data data/
 
-# Ensure our node user owns the directory we're using
-RUN chown node:node /usr/src/docs -R
+# Copy in build scripts and make them executable
+COPY --chown=node:node --chmod=+x \
+  src/deployments/production/build-scripts/*.sh build-scripts/
 
-# This should be our normal running user
-USER node
+# Use the mounted --secret to:
+# - 1. Fetch the docs-internal repo
+# - 2. Fetch the docs-early-access repo & override docs-internal with early access content
+# - 3. Fetch each translations repo to the repo/translations directory
+# We use --mount-type=secret to avoid the secret being copied into the image layers for security
+# The secret passed via --secret can only be used in this RUN command
+RUN --mount=type=secret,id=DOCS_BOT_PAT_READPUBLICKEY,mode=0444 \
+  # We don't cache because Docker can't know if we need to fetch new content from remote repos
+  echo "Don't cache this step by printing date: $(date)" && \
+  . ./build-scripts/fetch-repos.sh
 
-# Copy our dependencies
-COPY --chown=node:node --from=install /usr/src/docs/node_modules /usr/src/docs/node_modules
+# -----------------------------------------
+# DEPENDENCIES STAGE: Install node packages
+# -----------------------------------------
+FROM base AS dependencies
+USER node:node
+WORKDIR $APP_HOME
 
-# Copy our front-end code
-COPY --chown=node:node --from=install /usr/src/docs/dist /usr/src/docs/dist
+# Copy what is needed to run npm ci
+COPY --chown=node:node package.json package-lock.json ./
 
-# We should always be running in production mode
-ENV NODE_ENV production
+RUN npm ci --omit=optional --registry https://registry.npmjs.org/
 
-# Use Lunr instead of Algolia
-ENV AIRGAP true
+# -----------------------------------------
+# BUILD STAGE: Prepare for production stage
+# -----------------------------------------
+FROM base AS build
+USER node:node
+WORKDIR $APP_HOME
 
-# Copy only what's needed to run the server
-COPY --chown=node:node assets ./assets
-COPY --chown=node:node content ./content
-COPY --chown=node:node data ./data
-COPY --chown=node:node includes ./includes
-COPY --chown=node:node layouts ./layouts
-COPY --chown=node:node lib ./lib
-COPY --chown=node:node middleware ./middleware
-COPY --chown=node:node translations ./translations
-COPY --chown=node:node server.js ./server.js
-COPY --chown=node:node package*.json ./
-COPY --chown=node:node feature-flags.json ./
+# Source code
+COPY --chown=node:node src src/
+COPY --chown=node:node package.json ./
+COPY --chown=node:node next.config.js ./
+COPY --chown=node:node tsconfig.json ./
 
-EXPOSE 80
-EXPOSE 443
-EXPOSE 4000
-CMD ["node", "server.js"]
+# From the clones stage
+COPY --chown=node:node --from=clones $APP_HOME/data data/
+COPY --chown=node:node --from=clones $APP_HOME/assets assets/
+COPY --chown=node:node --from=clones $APP_HOME/content content/
+COPY --chown=node:node --from=clones $APP_HOME/translations translations/
+
+# From the dependencies stage
+COPY --chown=node:node --from=dependencies $APP_HOME/node_modules node_modules/
+
+# Generate build files
+RUN npm run build \
+  && npm run warmup-remotejson \
+  && npm run precompute-pageinfo -- --max-versions 2 \
+  && npm prune --production
+
+# -------------------------------------------------
+# PRODUCTION STAGE: What will run on the containers
+# -------------------------------------------------
+FROM base AS production
+USER node:node
+WORKDIR $APP_HOME
+
+# Source code
+COPY --chown=node:node src src/
+COPY --chown=node:node package.json ./
+COPY --chown=node:node next.config.js ./
+COPY --chown=node:node tsconfig.json ./
+
+# From clones stage
+COPY --chown=node:node --from=clones $APP_HOME/data data/
+COPY --chown=node:node --from=clones $APP_HOME/assets assets/
+COPY --chown=node:node --from=clones $APP_HOME/content content/
+COPY --chown=node:node --from=clones $APP_HOME/translations translations/
+
+# From dependencies stage (*modified in build stage)
+COPY --chown=node:node --from=build $APP_HOME/node_modules node_modules/
+
+# From build stage
+COPY --chown=node:node --from=build $APP_HOME/.next .next/
+COPY --chown=node:node --from=build $APP_HOME/.remotejson-cache ./
+COPY --chown=node:node --from=build $APP_HOME/.pageinfo-cache.json.br* ./
+
+# This makes it possible to set `--build-arg BUILD_SHA=abc123`
+# and it then becomes available as an environment variable in the docker run.
+ARG BUILD_SHA
+ENV BUILD_SHA=$BUILD_SHA
+
+# Entrypoint to start the server
+# Note: Currently we have to use tsx because
+# we have a mix of `.ts` and `.js` files with multiple import patterns
+CMD ["node_modules/.bin/tsx", "src/frame/server.ts"]
